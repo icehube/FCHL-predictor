@@ -1,0 +1,292 @@
+"""
+data_loader.py — CSV parsing, name matching, and schedule stat derivation.
+"""
+import csv
+import re
+from pathlib import Path
+
+import pandas as pd
+from thefuzz import process as fuzz_process, fuzz
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+NHL_TEAM_MAP: dict[str, str] = {
+    "Anaheim Ducks":        "ANA",
+    "Boston Bruins":        "BOS",
+    "Buffalo Sabres":       "BUF",
+    "Calgary Flames":       "CGY",
+    "Carolina Hurricanes":  "CAR",
+    "Chicago Blackhawks":   "CHI",
+    "Colorado Avalanche":   "COL",
+    "Columbus Blue Jackets":"CBJ",
+    "Dallas Stars":         "DAL",
+    "Detroit Red Wings":    "DET",
+    "Edmonton Oilers":      "EDM",
+    "Florida Panthers":     "FLA",
+    "Los Angeles Kings":    "LAK",
+    "Minnesota Wild":       "MIN",
+    "Montreal Canadiens":   "MTL",
+    "Nashville Predators":  "NSH",
+    "New Jersey Devils":    "NJD",
+    "New York Islanders":   "NYI",
+    "New York Rangers":     "NYR",
+    "Ottawa Senators":      "OTT",
+    "Philadelphia Flyers":  "PHI",
+    "Pittsburgh Penguins":  "PIT",
+    "San Jose Sharks":      "SJS",
+    "Seattle Kraken":       "SEA",
+    "St. Louis Blues":      "STL",
+    "Tampa Bay Lightning":  "TBL",
+    "Toronto Maple Leafs":  "TOR",
+    "Utah Mammoth":         "UTA",
+    "Vancouver Canucks":    "VAN",
+    "Vegas Golden Knights": "VGK",
+    "Washington Capitals":  "WSH",
+    "Winnipeg Jets":        "WPG",
+}
+
+DEFAULT_FCHL_POINTS: dict[str, int] = {
+    "BOT": 828,
+    "GVR": 878,
+    "LPT": 907,
+    "MAC": 819,
+    "SRL": 829,
+    "ZSK": 858,
+}
+
+FCHL_TEAMS = ["BOT", "GVR", "LPT", "MAC", "SRL", "ZSK"]
+
+# ---------------------------------------------------------------------------
+# FCHL Roster
+# ---------------------------------------------------------------------------
+
+def parse_player_name(raw: str) -> tuple[str, str]:
+    """
+    Parse 'F Artemi Panarin 3' → ('F', 'Artemi Panarin').
+    Strips the leading position token and trailing suffix (number or single letter).
+    """
+    parts = raw.strip().split()
+    if len(parts) < 2:
+        return "", raw
+    position = parts[0]
+    suffix = parts[-1]
+    # Suffix is a bare number (e.g. "3", "10") or a single uppercase letter (e.g. "A", "B", "C")
+    is_suffix = suffix.isdigit() or (len(suffix) == 1 and suffix.isalpha() and suffix.isupper())
+    name_parts = parts[1:-1] if (is_suffix and len(parts) > 2) else parts[1:]
+    return position, " ".join(name_parts)
+
+
+def load_fchl_roster(path: str) -> list[dict]:
+    """
+    Load 'FCHL Players - Sheet1.csv'.
+    Returns list of dicts: {name, position, fchl_team, raw}.
+    """
+    players = []
+    df = pd.read_csv(path)
+    for _, row in df.iterrows():
+        raw = str(row["PLAYER"]).strip()
+        team = str(row["TEAM"]).strip()
+        position, name = parse_player_name(raw)
+        players.append({
+            "raw": raw,
+            "name": name,
+            "position": position,
+            "fchl_team": team,
+        })
+    return players
+
+
+# ---------------------------------------------------------------------------
+# Skater stats
+# ---------------------------------------------------------------------------
+
+def load_skater_stats(path: str) -> dict[str, dict]:
+    """
+    Load skaters.csv, filter to situation=='all'.
+    Returns dict keyed by player name.
+    """
+    df = pd.read_csv(path)
+    df = df[df["situation"] == "all"].copy()
+
+    stats: dict[str, dict] = {}
+    for _, row in df.iterrows():
+        name = str(row["name"]).strip()
+        stats[name] = {
+            "name": name,
+            "nhl_team": str(row["team"]).strip(),
+            "games_played": float(row["games_played"]),
+            "goals": float(row.get("I_F_goals", 0) or 0),
+            "primary_assists": float(row.get("I_F_primaryAssists", 0) or 0),
+            "secondary_assists": float(row.get("I_F_secondaryAssists", 0) or 0),
+        }
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Goalie stats
+# ---------------------------------------------------------------------------
+
+def load_goalie_stats(path: str) -> dict[str, dict]:
+    """
+    Load goalies.csv, filter to situation=='all'.
+    Returns dict keyed by player name.
+    Wins/shutouts come from the schedule, not this file.
+    """
+    df = pd.read_csv(path)
+    df = df[df["situation"] == "all"].copy()
+
+    stats: dict[str, dict] = {}
+    for _, row in df.iterrows():
+        name = str(row["name"]).strip()
+        stats[name] = {
+            "name": name,
+            "nhl_team": str(row["team"]).strip(),
+            "games_played": float(row["games_played"]),
+        }
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Schedule
+# ---------------------------------------------------------------------------
+
+def load_schedule(path: str) -> dict:
+    """
+    Load nhl-202526-asplayed.csv using csv.reader (positional indexing)
+    because the file has two columns both named 'Score'.
+
+    Column indices (0-based, after header row):
+      0: Date, 1: Start Time (Sask), 2: Start Time (ET),
+      3: Visitor, 4: Visitor Score, 5: Home, 6: Home Score,
+      7: Status, 8: Visitor Goalie, 9: Home Goalie, ...
+
+    Returns a dict with:
+      team_completed: {nhl_abbr: int}  — completed games per team
+      team_remaining: {nhl_abbr: int}  — scheduled games per team
+      goalie_schedule_stats: {goalie_name: {starts, wins, shutouts}}
+    """
+    team_completed: dict[str, int] = {}
+    team_remaining: dict[str, int] = {}
+    goalie_stats: dict[str, dict] = {}
+
+    def _goalie_entry(name: str) -> dict:
+        if name not in goalie_stats:
+            goalie_stats[name] = {"starts": 0, "wins": 0, "shutouts": 0}
+        return goalie_stats[name]
+
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        next(reader)  # skip header
+
+        for row in reader:
+            if len(row) < 8:
+                continue
+
+            visitor_full = row[3].strip()
+            home_full = row[5].strip()
+            status = row[7].strip()
+
+            visitor_abbr = NHL_TEAM_MAP.get(visitor_full)
+            home_abbr = NHL_TEAM_MAP.get(home_full)
+
+            if status == "Scheduled":
+                if visitor_abbr:
+                    team_remaining[visitor_abbr] = team_remaining.get(visitor_abbr, 0) + 1
+                if home_abbr:
+                    team_remaining[home_abbr] = team_remaining.get(home_abbr, 0) + 1
+            else:
+                # Completed game
+                if visitor_abbr:
+                    team_completed[visitor_abbr] = team_completed.get(visitor_abbr, 0) + 1
+                if home_abbr:
+                    team_completed[home_abbr] = team_completed.get(home_abbr, 0) + 1
+
+                visitor_goalie = row[8].strip() if len(row) > 8 else ""
+                home_goalie = row[9].strip() if len(row) > 9 else ""
+
+                # Parse scores
+                try:
+                    v_score = int(row[4].strip())
+                    h_score = int(row[6].strip())
+                except (ValueError, IndexError):
+                    continue
+
+                # Goalie starts
+                if visitor_goalie:
+                    _goalie_entry(visitor_goalie)["starts"] += 1
+                if home_goalie:
+                    _goalie_entry(home_goalie)["starts"] += 1
+
+                # Wins (one winner always — no ties in NHL)
+                if visitor_goalie and home_goalie:
+                    if v_score > h_score:
+                        _goalie_entry(visitor_goalie)["wins"] += 1
+                    else:
+                        _goalie_entry(home_goalie)["wins"] += 1
+
+                # Shutouts
+                if home_goalie and v_score == 0:
+                    _goalie_entry(home_goalie)["shutouts"] += 1
+                if visitor_goalie and h_score == 0:
+                    _goalie_entry(visitor_goalie)["shutouts"] += 1
+
+    return {
+        "team_completed": team_completed,
+        "team_remaining": team_remaining,
+        "goalie_schedule_stats": goalie_stats,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Name matching
+# ---------------------------------------------------------------------------
+
+def fuzzy_match_name(query: str, candidates: list[str], score_cutoff: int = 80) -> str | None:
+    """
+    Use thefuzz to find the best matching name above the cutoff.
+    Returns the matched string or None.
+    """
+    if not candidates:
+        return None
+    result = fuzz_process.extractOne(query, candidates, scorer=fuzz.token_sort_ratio)
+    if result and result[1] >= score_cutoff:
+        return result[0]
+    return None
+
+
+def build_player_lookup(
+    fchl_roster: list[dict],
+    skater_stats: dict[str, dict],
+    goalie_stats: dict[str, dict],
+) -> dict[str, str | None]:
+    """
+    For each FCHL player, find their matching key in the appropriate stats dict.
+    Returns {fchl_player_name: matched_stats_key | None}.
+    Run once at startup.
+    """
+    skater_names = list(skater_stats.keys())
+    goalie_names = list(goalie_stats.keys())
+
+    lookup: dict[str, str | None] = {}
+
+    for player in fchl_roster:
+        name = player["name"]
+        if name in lookup:
+            continue
+
+        if player["position"] == "G":
+            candidates = goalie_names
+            pool = goalie_stats
+        else:
+            candidates = skater_names
+            pool = skater_stats
+
+        if name in pool:
+            lookup[name] = name
+        else:
+            matched = fuzzy_match_name(name, candidates)
+            lookup[name] = matched  # None if no match
+
+    return lookup
