@@ -70,6 +70,7 @@ FCHL-predictor/
 ├── data_loader.py                # CSV parsing, name fuzzy matching, schedule stat derivation
 ├── projections.py                # Projection math (per-game rates, goalie start scaling)
 ├── requirements.txt              # streamlit, pandas, thefuzz, python-Levenshtein
+├── README.md                     # User-facing documentation (keep in sync with changes)
 └── data/
     ├── FCHL Players - Sheet1.csv # FCHL fantasy rosters (6 teams, ~20 players each)
     ├── nhl-202526-asplayed.csv   # Full 2025-26 NHL schedule (played + remaining games)
@@ -159,7 +160,22 @@ After any code changes:
 
 1. **Verify the app still runs**: `streamlit run app.py`
 2. **Check Tab 2 warnings** — should show 0 or minimal unmatched players
-3. **Update CLAUDE.md** if project structure, scoring, or data sources change
+3. **Update README.md** if any of the following change:
+   - Project structure (files added/moved/removed)
+   - Scoring rules
+   - Setup or run instructions
+   - Data sources or their format
+4. **Update CLAUDE.md** if project structure, scoring, data sources, or coding standards change
+
+### README Sections to Keep in Sync
+
+| README section      | Changes that require an update                          |
+|---------------------|---------------------------------------------------------|
+| Features            | New app capabilities added or existing ones removed     |
+| Scoring             | Point values change                                     |
+| Setup               | New dependencies or changed run command                 |
+| Project Structure   | Files added, removed, or moved                         |
+| Data                | New CSVs, renamed files, changed data format            |
 
 ---
 
